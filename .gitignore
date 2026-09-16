@@ -1,0 +1,30 @@
+# Godot editor and imported caches
+.godot/
+.import/
+
+# Temporary files and logs
+*.tmp
+*.log
+
+# Exported builds and packages
+*.apk
+*.aab
+*.ipa
+*.pck
+*.zip
+export/
+build/
+exports/
+android/
+ios/
+
+# Local-only game saves and credentials
+*.save
+*.keystore
+*.jks
+*.mobileprovision
+*.p12
+*.pem
+*.key
+.env
+.env.*
