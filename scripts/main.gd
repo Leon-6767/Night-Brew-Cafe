@@ -761,20 +761,20 @@ func build_ui() -> void:
 	ui_root = Control.new(); ui_root.name = "UIRoot"; ui_root.theme = NightBrewTheme; ui_root.mouse_filter = Control.MOUSE_FILTER_IGNORE; fill_parent(ui_root); ui_layer.add_child(ui_root)
 	var layer: Control = ui_root
 	var top: ColorRect = ColorRect.new(); top.set_anchors_preset(Control.PRESET_TOP_WIDE); top.offset_bottom=176; top.color=Color("#fff1d4"); layer.add_child(top)
-	hud_label=Label.new(); hud_label.set_anchors_preset(Control.PRESET_TOP_LEFT); hud_label.offset_left=32; hud_label.offset_top=24; hud_label.offset_right=690; hud_label.offset_bottom=150; hud_label.add_theme_font_size_override("font_size",30); hud_label.add_theme_color_override("font_color",Color("#51342e")); top.add_child(hud_label)
+	hud_label=Label.new(); hud_label.set_anchors_preset(Control.PRESET_TOP_WIDE); hud_label.offset_left=32; hud_label.offset_top=24; hud_label.offset_right=-270; hud_label.autowrap_mode=TextServer.AUTOWRAP_WORD_SMART; hud_label.offset_bottom=150; hud_label.add_theme_font_size_override("font_size",30); hud_label.add_theme_color_override("font_color",Color("#51342e")); top.add_child(hud_label)
 	var top_actions: HBoxContainer=HBoxContainer.new(); top_actions.set_anchors_preset(Control.PRESET_TOP_RIGHT); top_actions.offset_left=-235; top_actions.offset_top=44; top_actions.offset_right=-24; top_actions.offset_bottom=130; top_actions.add_theme_constant_override("separation",12); top.add_child(top_actions)
-	var camera_home: Button=Button.new(); camera_home.text="⌂"; camera_home.tooltip_text="回到店铺中心"; camera_home.custom_minimum_size=Vector2(90,86); camera_home.pressed.connect(reset_world_camera); top_actions.add_child(camera_home)
+	var camera_home: Button=Button.new(); camera_home.icon=preload("res://assets/ui/icons/nav_home.svg"); camera_home.add_theme_constant_override("icon_max_width",48); camera_home.tooltip_text="回到店铺中心"; camera_home.custom_minimum_size=Vector2(90,86); camera_home.pressed.connect(reset_world_camera); top_actions.add_child(camera_home)
 	first_floor_button=Button.new(); first_floor_button.text="1F"; first_floor_button.custom_minimum_size=Vector2(76,86); first_floor_button.pressed.connect(focus_floor.bind(1)); first_floor_button.visible=false; top_actions.add_child(first_floor_button)
 	second_floor_button=Button.new(); second_floor_button.text="2F"; second_floor_button.custom_minimum_size=Vector2(76,86); second_floor_button.pressed.connect(focus_floor.bind(2)); second_floor_button.visible=false; top_actions.add_child(second_floor_button)
 	var wrench: Button=Button.new(); wrench.text="设置"; wrench.custom_minimum_size=Vector2(105,86); wrench.pressed.connect(toggle_settings); top_actions.add_child(wrench)
-	var order_button: Button=Button.new(); order_button.text="☕\n订单"; order_button.set_anchors_preset(Control.PRESET_BOTTOM_LEFT); order_button.offset_left=20; order_button.offset_top=-430; order_button.offset_right=140; order_button.offset_bottom=-326; layer.add_child(order_button)
+	var order_button: Button=Button.new(); order_button.text="订单"; order_button.icon=preload("res://assets/ui/icons/icon_coffee.svg"); order_button.add_theme_constant_override("icon_max_width",40); order_button.set_anchors_preset(Control.PRESET_BOTTOM_LEFT); order_button.offset_left=20; order_button.offset_top=-430; order_button.offset_right=140; order_button.offset_bottom=-326; layer.add_child(order_button)
 	var speed: Button=Button.new(); speed.text="×%d" % int(speed_multiplier); speed.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT); speed.offset_left=-145; speed.offset_top=-430; speed.offset_right=-20; speed.offset_bottom=-348; speed.pressed.connect(cycle_speed.bind(speed)); layer.add_child(speed)
-	var pause: Button=Button.new(); pause.text="Ⅱ"; pause.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT); pause.offset_left=-145; pause.offset_top=-335; pause.offset_right=-20; pause.offset_bottom=-253; pause.pressed.connect(toggle_pause.bind(pause)); layer.add_child(pause)
+	var pause: Button=Button.new(); pause.text="暂停"; pause.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT); pause.offset_left=-145; pause.offset_top=-335; pause.offset_right=-20; pause.offset_bottom=-253; pause.pressed.connect(toggle_pause.bind(pause)); layer.add_child(pause)
 	end_day_button=Button.new(); end_day_button.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT); end_day_button.offset_left=-320; end_day_button.offset_top=-560; end_day_button.offset_right=-20; end_day_button.offset_bottom=-470; end_day_button.pressed.connect(close_day); end_day_button.name="ShopToggle"; end_day_button.visible=false; layer.add_child(end_day_button)
 	var nav: ColorRect=ColorRect.new(); nav.set_anchors_preset(Control.PRESET_BOTTOM_WIDE); nav.offset_top=-250; nav.offset_bottom=-16; nav.color=Color("#fff1d4"); layer.add_child(nav)
 	var bar: HBoxContainer=HBoxContainer.new(); fill_parent(bar, 20); bar.add_theme_constant_override("separation",15); nav.add_child(bar)
-	for text in ["☕\n店铺","👥\n员工","🪴\n装修","▣\n补给","⌂\n城市"]:
-		var b: Button=Button.new(); b.text=text; b.custom_minimum_size=Vector2(190,140); bar.add_child(b)
+	for text in ["店铺","员工","装修","补给","城市"]:
+		var b: Button=Button.new(); b.text=text; b.custom_minimum_size=Vector2(0,100); b.size_flags_horizontal=Control.SIZE_EXPAND_FILL; b.icon=load("res://assets/ui/icons/nav_%s.svg" % str(["home","staff","decor","supply","city"][bar.get_child_count()])); b.vertical_icon_alignment=VERTICAL_ALIGNMENT_TOP; b.icon_alignment=HORIZONTAL_ALIGNMENT_CENTER; b.add_theme_constant_override("icon_max_width",52); bar.add_child(b)
 	bar.get_child(1).pressed.connect(toggle_staff)
 	bar.get_child(2).pressed.connect(toggle_decor)
 	bar.get_child(3).pressed.connect(toggle_supply_panel)
@@ -934,6 +934,15 @@ func set_game_orientation(mode: String) -> void:
 
 func apply_game_orientation(show_message: bool) -> void:
 	var main_window: Window = get_window()
+	if OS.has_feature("web"):
+		if not main_window.size_changed.is_connected(sync_web_viewport):
+			main_window.size_changed.connect(sync_web_viewport)
+		sync_web_viewport()
+		if show_message:
+			show_alert("请旋转手机，画面会自动适配横屏或竖屏")
+		if settings_panel:
+			settings_panel.hide()
+		return
 	if game_orientation == "竖屏":
 		DisplayServer.screen_set_orientation(DisplayServer.SCREEN_SENSOR_PORTRAIT)
 		main_window.content_scale_size = Vector2i(1080, 1920)
@@ -949,6 +958,18 @@ func apply_game_orientation(show_message: bool) -> void:
 		show_alert("已切换为%s游玩" % game_orientation)
 	if settings_panel:
 		settings_panel.hide()
+
+func sync_web_viewport() -> void:
+	var main_window: Window = get_window()
+	var portrait: bool = main_window.size.y > main_window.size.x
+	var base_size: Vector2i = Vector2i(1080, 1920) if portrait else Vector2i(1920, 1080)
+	if main_window.content_scale_size != base_size:
+		main_window.content_scale_size = base_size
+		# Frame the initial shop when switching aspect, preserving later player zoom.
+		camera_target_zoom = 0.75 if portrait else 1.0
+		if world_camera:
+			world_camera.zoom = Vector2.ONE * camera_target_zoom
+	call_deferred("refresh_orientation_layout")
 
 func refresh_orientation_layout() -> void:
 	if ui_root:
@@ -1362,7 +1383,7 @@ func cycle_speed(button: Button) -> void:
 
 func toggle_pause(button: Button) -> void:
 	paused = not paused
-	button.text = "▶" if paused else "Ⅱ"
+	button.text = "继续" if paused else "暂停"
 
 func _unhandled_input(event: InputEvent) -> void:
 	# CanvasLayer controls consume their own events, so only empty shop space reaches here.
