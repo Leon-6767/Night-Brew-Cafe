@@ -67,6 +67,8 @@ var orders: Array[Dictionary] = []
 var hud_label: Label
 var debug_label: Label
 var alert_label: Label
+var order_panel: PanelContainer
+var alert_generation: int = 0
 var staff_panel: PanelContainer
 var debug_panel: PanelContainer
 var selected_actor: CafeActor
@@ -779,6 +781,14 @@ func build_ui() -> void:
 	bar.get_child(2).pressed.connect(toggle_decor)
 	bar.get_child(3).pressed.connect(toggle_supply_panel)
 	bar.get_child(4).pressed.connect(toggle_finance_panel)
+	order_panel = preload("res://scripts/ui/order_panel.gd").new()
+	layer.add_child(order_panel)
+	order_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	order_panel.offset_left=32; order_panel.offset_top=190; order_panel.offset_right=-32; order_panel.offset_bottom=-270
+	order_panel.cafe = self
+	order_panel.order_button = order_button
+	order_panel.hide()
+	order_button.pressed.connect(toggle_order_panel)
 	alert_label=Label.new(); alert_label.set_anchors_preset(Control.PRESET_TOP_WIDE); alert_label.offset_left=160; alert_label.offset_top=185; alert_label.offset_right=-220; alert_label.offset_bottom=247; alert_label.horizontal_alignment=HORIZONTAL_ALIGNMENT_CENTER; alert_label.add_theme_font_size_override("font_size",34); alert_label.add_theme_color_override("font_color",Color("#9a5338")); layer.add_child(alert_label)
 	selection_card=Label.new(); selection_card.set_anchors_preset(Control.PRESET_BOTTOM_WIDE); selection_card.offset_left=140; selection_card.offset_top=-390; selection_card.offset_right=-140; selection_card.offset_bottom=-290; selection_card.horizontal_alignment=HORIZONTAL_ALIGNMENT_CENTER; selection_card.add_theme_font_size_override("font_size",30); selection_card.add_theme_color_override("font_color",Color("#51342e")); selection_card.visible=false; layer.add_child(selection_card)
 	debug_panel=PanelContainer.new(); center_popup(debug_panel, Vector2(900,620)); debug_panel.visible=false; layer.add_child(debug_panel)
@@ -997,11 +1007,10 @@ func apply_ui_readability(node: Node) -> void:
 
 func update_ui() -> void:
 	if not hud_label: return
-	var activity: String = "营业准备" if phase != "Open" else current_activity()
 	var world_hour: int = floori(world_minutes / 60.0)
 	var world_minute: int = int(world_minutes) % 60
 	var rep_progress: int = reputation_points % 100
-	hud_label.text="夜酿咖啡馆 · 第 %d 天 · %02d:%02d\n金币 %d · 声望 Lv.%d（%d/100）· 环境 %d   ·   %s" % [day,world_hour,world_minute,coins,reputation,rep_progress,environment_score,activity]
+	hud_label.text="夜酿咖啡馆 · 第 %d 天 · %02d:%02d\n金币 %d · 声望 Lv.%d（%d/100）· 环境 %d" % [day,world_hour,world_minute,coins,reputation,rep_progress,environment_score]
 	if first_floor_button: first_floor_button.visible = second_floor_unlocked
 	if second_floor_button: second_floor_button.visible = second_floor_unlocked
 	if end_day_button:
@@ -1023,8 +1032,17 @@ func current_activity() -> String:
 func toggle_debug() -> void:
 	debug_panel.visible = not debug_panel.visible
 
+func toggle_order_panel() -> void:
+	var opening: bool = not order_panel.visible
+	if opening:
+		close_navigation_panels(order_panel)
+		if settings_panel: settings_panel.hide()
+		order_panel.refresh()
+		alert_label.hide()
+	order_panel.visible = opening
+
 func close_navigation_panels(except_panel: Control = null) -> void:
-	for panel in [staff_panel, decor_panel, supply_panel, market_panel, menu_panel, finance_panel]:
+	for panel in [order_panel, staff_panel, decor_panel, supply_panel, market_panel, menu_panel, finance_panel]:
 		if panel and panel != except_panel:
 			panel.hide()
 	if decor_panel != except_panel and world and world.decoration_mode:
@@ -1983,7 +2001,16 @@ func dismiss_employee(employee_name: String) -> void:
 	populate_staff_list()
 	save_game()
 	show_alert("%s 已解雇" % employee_name)
-func show_alert(text: String) -> void: alert_label.text=text
+func show_alert(text: String) -> void:
+	if text.begins_with("缺货") or text == "咖啡师或食材暂不可用": return
+	alert_generation += 1
+	var generation: int = alert_generation
+	alert_label.text = text
+	alert_label.show()
+	get_tree().create_timer(4.0).timeout.connect(func() -> void:
+		if is_instance_valid(alert_label) and generation == alert_generation:
+			alert_label.hide()
+	)
 func save_game() -> void: SaveSystem.save_game({"day":day,"coins":coins,"revenue":revenue,"daily_ingredient_cost":daily_ingredient_cost,"daily_spoilage_cost":daily_spoilage_cost,"daily_served":daily_served,"active_calendar_date":active_calendar_date,"financial_days":financial_days,"ingredients":ingredients,"market_prices":market_prices,"market_trends":market_trends,"market_price_day":market_price_day,"fridge_level":fridge_level,"researched_menu":researched_menu,"active_menu":active_menu,"upgrades":upgrades,"unlocks":unlocks,"employee_levels":employee_levels,"owned_staff":owned_staff,"staff_assignments":staff_assignments,"staff_floors":staff_floors,"staff_loyalty":staff_loyalty,"staff_stars":staff_stars,"furniture_items":furniture_items,"expansions":expansions,"next_furniture_id":next_furniture_id,"ui_size_mode":ui_size_mode,"game_orientation":game_orientation,"reputation":reputation,"reputation_points":reputation_points,"coffee_competition_complete":coffee_competition_complete,"current_event":current_event,"event_day":event_day,"event_resolved":event_resolved,"event_result_text":event_result_text,"event_modifiers":event_modifiers,"market_candidates":market_candidates,"market_day":market_day,"market_refreshes_today":market_refreshes_today,"cleaning_room_level":cleaning_room_level,"second_floor_unlocked":second_floor_unlocked,"second_floor_level":second_floor_level,"settled_real_date":settled_real_date,"last_online_unix":int(Time.get_unix_time_from_system())})
 func load_save() -> void:
 	var data: Dictionary = SaveSystem.load_game()
