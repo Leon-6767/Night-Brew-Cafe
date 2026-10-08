@@ -31,4 +31,4 @@ func tick_staff(delta: float) -> void:
 		stamina = max(0.0, stamina - delta * 1.15)
 	if resting: stamina = minf(100.0, stamina + delta * 18.0)
 	move_speed = 80.0 if stamina < 30.0 else 145.0 + service_skill * 12.0
-	refresh_visual(str(task.get("kind", "")))
+	refresh_visual(str(task.get("kind", "")) if str(task.get("stage", "")).begins_with("work") or task.get("stage", "") == "move_table" else "")

@@ -14,6 +14,8 @@ var decoration_mode: bool = false
 var decorations: Array[Vector2] = []
 var table_states: Array[String] = ["Free", "Free", "Free", "Free", "Free"]
 var table_nodes: Array = []
+var furniture_nodes: Dictionary = {}
+var fixed_blocks: Array[Node2D] = []
 var furniture_items: Array[Dictionary] = []
 var expansions: Dictionary = {"LeftWindow": false}
 var preview_type: String = ""
@@ -56,12 +58,14 @@ func set_furniture(items: Array[Dictionary], expansion_data: Dictionary, pending
 	preview_valid = is_valid
 	preview_rotation = rotation
 	preview_floor = floor_level
+	sync_furniture_nodes()
 	queue_redraw()
 
 func set_second_floor(unlocked: bool, level: int) -> void:
 	second_floor_unlocked = unlocked
 	second_floor_level = level
 	ensure_table_nodes()
+	sync_fixed_blocks()
 	queue_redraw()
 
 func table_cells() -> Array[Vector2i]:
@@ -69,7 +73,7 @@ func table_cells() -> Array[Vector2i]:
 
 func second_floor_table_cells() -> Array[Vector2i]:
 	if not second_floor_unlocked: return []
-	var cells: Array[Vector2i] = [Vector2i(3,4), Vector2i(6,4)]
+	var cells: Array[Vector2i] = [Vector2i(3,4), Vector2i(4,4)]
 	if second_floor_level >= 2: cells.append_array([Vector2i(3,7), Vector2i(6,7)])
 	if second_floor_level >= 3: cells.append_array([Vector2i(5,9), Vector2i(8,6)])
 	return cells
@@ -93,6 +97,8 @@ func table_positions() -> Array[Vector2]:
 
 func _ready() -> void:
 	ensure_table_nodes()
+	sync_furniture_nodes()
+	sync_fixed_blocks()
 
 func ensure_table_nodes() -> void:
 	var cells: Array[Vector2i] = all_table_cells()
@@ -104,7 +110,7 @@ func ensure_table_nodes() -> void:
 		if i < cells.size():
 			table_nodes[i].visible = true
 			table_nodes[i].position = table_screen_position(i)
-			table_nodes[i].z_index = int(table_nodes[i].position.y)
+			table_nodes[i].z_index = 1000 + int(table_nodes[i].position.y)
 		else:
 			table_nodes[i].visible = false
 
@@ -134,8 +140,6 @@ func _draw() -> void:
 					draw_polyline(PackedVector2Array([expansion_tile[0], expansion_tile[1], expansion_tile[2], expansion_tile[3], expansion_tile[0]]), Color(1,1,1,.22), 1.0)
 	if second_floor_unlocked:
 		draw_second_floor()
-	for item in furniture_items:
-		draw_furniture(item, Color.WHITE)
 	if preview_type != "":
 		var preview_item: Dictionary = {"type": preview_type, "x": preview_cell.x, "y": preview_cell.y, "rotation": preview_rotation, "floor": preview_floor}
 		draw_furniture(preview_item, Color(0.35, 0.95, 0.5, 0.55) if preview_valid else Color(1.0, 0.25, 0.25, 0.55))
@@ -153,10 +157,8 @@ func _draw() -> void:
 		draw_line(lamp+Vector2(0,-40),lamp,Color("#55362c"),2)
 		draw_circle(lamp,12,Color("#ffd37b"))
 	# iso bar counter + clearly visible coffee machine, pastry case, staff rest corner
-	draw_iso_block(Vector2i(2,1),Vector2i(3,2),Color("#704538"),30)
 	var machine := grid_to_screen(Vector2i(3,2)) + Vector2(0,-24)
 	draw_colored_polygon(PackedVector2Array([machine+Vector2(0,-20),machine+Vector2(24,-8),machine+Vector2(0,4),machine+Vector2(-24,-8)]),Color("#343941"))
-	draw_iso_block(Vector2i(7,1),Vector2i(2,1),Color("#9a6951"),24)
 	draw_iso_block(Vector2i(8,8),Vector2i(1,1),Color("#8a6358"),14)
 	var plant := grid_to_screen(Vector2i(9,8))+Vector2(0,-25)
 	draw_circle(plant,19,Color("#69a477")); draw_rect(Rect2(plant+Vector2(-8,13),Vector2(16,18)),Color("#b77b56"),true)
@@ -176,11 +178,10 @@ func draw_second_floor() -> void:
 			draw_colored_polygon(tile, Color("#c8915d") if (x+y)%2 == 0 else Color("#b77b50"))
 			if decoration_mode:
 				draw_polyline(PackedVector2Array([tile[0],tile[1],tile[2],tile[3],tile[0]]),Color(1,1,1,.22),1.0)
-	draw_iso_block_floor(Vector2i(1,1), Vector2i(3,2), Color("#62433b"), 26, 2)
 	var machine: Vector2 = floor_grid_to_screen(Vector2i(2,2), 2) + Vector2(0,-20)
 	draw_circle(machine, 16, Color("#39414c"))
 	var stair_bottom: Vector2 = grid_to_screen(Vector2i(9,7))
-	var stair_top: Vector2 = floor_grid_to_screen(Vector2i(9,7),2)
+	var stair_top: Vector2 = floor_grid_to_screen(Vector2i(5,5),2)
 	draw_line(stair_bottom, stair_top, Color("#8b5c45"), 18)
 
 func draw_iso_block_floor(cell: Vector2i, size: Vector2i, color: Color, height: float, floor_level: int) -> void:
@@ -218,3 +219,76 @@ func draw_furniture(item: Dictionary, tint: Color) -> void:
 	draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 	if item_type == "Plant":
 		draw_circle(center + Vector2(0,-20), 14, Color("#6baa70") * tint)
+
+class PlacedFurniture extends Node2D:
+	var world: Node
+	var item: Dictionary
+	func _draw() -> void:
+		var local_item: Dictionary = item.duplicate()
+		local_item["x"] = 0
+		local_item["y"] = 0
+		var type: String = str(item.type)
+		var color := Color("#9b6249")
+		if type == "CoffeeMachine": color = Color("#424955")
+		elif type == "Register": color = Color("#725a4b")
+		elif type == "Sofa": color = Color("#7a8f9c")
+		elif type == "Plant": color = Color("#5b9a6a")
+		var size := Vector2(30,17)
+		if type == "DoubleTable": size = Vector2(55,20) if int(item.get("rotation",0)) % 2 == 0 else Vector2(30,35)
+		draw_set_transform(Vector2.ZERO,0.0,size)
+		draw_circle(Vector2.ZERO,1.0,color)
+		draw_set_transform(Vector2.ZERO,0.0,Vector2.ONE)
+		if type == "Plant": draw_circle(Vector2(0,-20),14,Color("#6baa70"))
+
+func sync_furniture_nodes() -> void:
+	var present: Array[int] = []
+	for item in furniture_items:
+		var id: int = int(item.id)
+		present.append(id)
+		if not furniture_nodes.has(id):
+			var node := PlacedFurniture.new()
+			add_child(node)
+			furniture_nodes[id] = node
+		var node: Node2D = furniture_nodes[id]
+		node.item = item.duplicate()
+		node.position = floor_grid_to_screen(Vector2i(int(item.x),int(item.y)),int(item.get("floor",1)))
+		node.z_index = 1000 + int(node.position.y)
+		node.queue_redraw()
+	for id in furniture_nodes.keys():
+		if id not in present:
+			furniture_nodes[id].queue_free()
+			furniture_nodes.erase(id)
+
+class CounterBlock extends Node2D:
+	var size: Vector2i
+	var color: Color
+	var height: float
+	func _draw() -> void:
+		var a := Vector2(0,-32)
+		var b := Vector2(size.x*64,size.x*32-32)
+		var c := Vector2((size.x-size.y)*64,(size.x+size.y)*32-32)
+		var d := Vector2(-size.y*64,size.y*32-32)
+		draw_colored_polygon(PackedVector2Array([a+Vector2(0,-height),b+Vector2(0,-height),c+Vector2(0,-height),d+Vector2(0,-height)]),color.lightened(0.12))
+		draw_colored_polygon(PackedVector2Array([d+Vector2(0,-height),c+Vector2(0,-height),c,d]),color.darkened(0.18))
+		if size.x == 3: draw_circle(Vector2(0,8),16,Color("#39414c"))
+
+func sync_fixed_blocks() -> void:
+	var definitions: Array = [
+		{"cell":Vector2i(2,1),"size":Vector2i(3,2),"floor":1,"color":Color("#704538"),"height":30.0},
+		{"cell":Vector2i(7,1),"size":Vector2i(2,1),"floor":1,"color":Color("#9a6951"),"height":24.0}]
+	if second_floor_unlocked: definitions.append({"cell":Vector2i(1,1),"size":Vector2i(3,2),"floor":2,"color":Color("#62433b"),"height":26.0})
+	while fixed_blocks.size() < definitions.size():
+		var block := CounterBlock.new()
+		add_child(block)
+		fixed_blocks.append(block)
+	for i in fixed_blocks.size():
+		var block: Node2D = fixed_blocks[i]
+		block.visible = i < definitions.size()
+		if not block.visible: continue
+		var definition: Dictionary = definitions[i]
+		block.position = floor_grid_to_screen(definition.cell,definition.floor)
+		block.size = definition.size
+		block.color = definition.color
+		block.height = definition.height
+		block.z_index = 1000 + int(block.position.y) + (definition.size.x+definition.size.y-2)*32
+		block.queue_redraw()

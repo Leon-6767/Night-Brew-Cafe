@@ -64,6 +64,16 @@ var customers: Array[Customer] = []
 var staff: Array[Staff] = []
 var table_owner: Array = [null,null,null,null,null]
 var orders: Array[Dictionary] = []
+var table_keys: Array[String] = []
+var navigation := CafeNavigation.new()
+var saved_runtime: Dictionary = {}
+var saved_last_online: int = 0
+var replay_unix: int = 0
+var replaying: bool = false
+var autosave_timer: float = 30.0
+var last_settled_date: String = ""
+var default_employee_data: Array[Dictionary] = []
+var reserved_ingredients: Dictionary = {}
 var hud_label: Label
 var debug_label: Label
 var alert_label: Label
@@ -166,6 +176,7 @@ var employee_data: Array[Dictionary] = [
 ]
 
 func _ready() -> void:
+	default_employee_data.assign(employee_data.duplicate(true))
 	# Gameplay uses direct 2:1 isometric grid projection; UI remains upright in CanvasLayer.
 	shop_layer = Node2D.new()
 	add_child(shop_layer)
@@ -181,9 +192,12 @@ func _ready() -> void:
 	else: load_save()
 	apply_game_orientation(false)
 	sync_furniture_state(); refresh_market_for_day(); refresh_market_prices(); spawn_staff(); build_ui(); update_ui()
+	restore_runtime(saved_runtime)
 	update_world_clock()
-	finalize_calendar_rollover()
 	begin_auto_business()
+	apply_offline_earnings(saved_last_online)
+	finalize_calendar_rollover()
+	save_game()
 
 func begin_auto_business() -> void:
 	# Permanent 24-hour operation never needs the legacy preparation or settlement modal.
@@ -198,39 +212,45 @@ func begin_auto_business() -> void:
 		needs_new_calendar_day = false
 	else:
 		phase = "Open"
-		spawn_timer = 0.1
 	if offline_earnings > 0:
 		show_alert("离线营业 %d 分钟：获得 %d 金币" % [offline_minutes, offline_earnings])
 	else:
 		show_alert("咖啡店已自动营业")
 
 func apply_offline_earnings(last_unix: int) -> void:
-	if last_unix <= 0: return
-	var now_unix: int = int(Time.get_unix_time_from_system())
-	offline_minutes = clampi((now_unix - last_unix) / 60, 0, 480)
-	var cycles: int = offline_minutes / 3
-	var available_workers: int = 0
-	for data in employee_data:
-		var staff_name: String = str(data.get("name", ""))
-		if bool(owned_staff.get(staff_name, false)) and bool(staff_assignments.get(staff_name, false)): available_workers += 1
-	cycles = mini(cycles, available_workers * 40)
-	for i in cycles:
-		if int(ingredients.get("Beans", 0)) <= 0: break
-		ingredients["Beans"] = int(ingredients.get("Beans", 0)) - 1
-		var sale: int = 12
-		if int(ingredients.get("Milk", 0)) > 0:
-			ingredients["Milk"] = int(ingredients.get("Milk", 0)) - 1
-			sale = 18
-		coins += sale
-		revenue += sale
-		daily_served += 1
-		offline_earnings += sale
+	var now: int = current_unix()
+	if last_unix <= 0 or now <= last_unix or paused: return
+	var seconds: int = mini(now - last_unix, 480 * 60)
+	offline_minutes = seconds / 60
+	offline_earnings = 0
+	replaying = true
+	replay_unix = now - seconds
+	for tick in seconds:
+		replay_unix += 1
+		update_world_clock()
+		finalize_calendar_rollover()
+		simulate_business(1.0)
+	replay_unix = 0
+	replaying = false
+	update_world_clock()
+	if offline_earnings > 0: show_alert("离线营业 %d 分钟：营业额 %d 金币（工资和成本已计入账目）" % [offline_minutes, offline_earnings])
 
 func _process(delta: float) -> void:
 	var dt: float = 0.0 if paused else delta * speed_multiplier
 	update_world_clock()
-	finalize_calendar_rollover()
+	if not paused: finalize_calendar_rollover()
 	update_camera(delta)
+	if paused:
+		update_ui()
+		return
+	simulate_business(dt)
+	autosave_timer -= delta
+	if autosave_timer <= 0.0:
+		save_game()
+		autosave_timer = 30.0
+	update_ui()
+
+func simulate_business(dt: float) -> void:
 	move_visible_actors(dt)
 	for worker in staff: worker.tick_staff(dt); advance_staff(worker, dt)
 	if phase == "Open":
@@ -240,20 +260,53 @@ func _process(delta: float) -> void:
 			spawn_timer = 5.0
 		for guest in customers.duplicate(): advance_customer(guest, dt)
 		assign_tasks()
-	update_ui()
 
 func move_visible_actors(delta: float) -> void:
 	var actors: Array = []
 	actors.append_array(staff)
 	actors.append_array(customers)
+	navigation.set_crowd(actors)
 	for actor in actors:
-		if actor.position.distance_to(actor.target_position) > 3.0:
-			var movement_multiplier: float = 0.72 if actor is Staff and bool(event_modifiers.get("sick", false)) else 1.0
-			actor.position = actor.position.move_toward(actor.target_position, actor.move_speed * movement_multiplier * delta)
-			actor.is_moving = true
-		else:
-			actor.is_moving = false
-		actor.z_index = int(actor.position.y)
+		var target_floor: int = actor.floor_level
+		if actor is Customer and actor.phase == "queue": target_floor = 1
+		var multiplier: float = 0.72 if actor is Staff and bool(event_modifiers.get("sick", false)) else 1.0
+		actor.follow_route(navigation, target_floor, delta * multiplier, actors)
+		if actor.route_failed and actor is Staff and not actor.task.is_empty(): cancel_task(actor)
+		actor.z_index = 1000 + int(actor.position.y)
+		actor.refresh_visual()
+
+func unoccupied_point(cell: Vector2i, floor_level: int, except_actor: CafeActor = null) -> Vector2:
+	var options: Array[Vector2i] = [cell,cell+Vector2i(1,0),cell+Vector2i(0,1),cell+Vector2i(-1,0),cell+Vector2i(0,-1)]
+	for option in options:
+		if not navigation.walkable(option,floor_level): continue
+		var point: Vector2 = cell_to_screen(option,floor_level)
+		var occupied: bool = false
+		for actor in staff + customers:
+			if actor == except_actor or actor.navigation_floor != floor_level: continue
+			if actor.position.distance_to(point) < 20.0 or actor.target_position.distance_to(point) < 1.0: occupied = true; break
+		if not occupied: return point
+	return cell_to_screen(cell,floor_level)
+
+func staff_contact_point(guest: Customer, worker: Staff = null) -> Vector2:
+	var cell: Vector2i = world.screen_to_floor_grid(guest.position,guest.floor_level)
+	for offset in [Vector2i(1,0),Vector2i(0,1),Vector2i(-1,0),Vector2i(0,-1)]:
+		if navigation.walkable(cell+offset,guest.floor_level): return unoccupied_point(cell+offset,guest.floor_level,worker)
+	return guest.position
+
+func staff_station_point(role: String, floor_level: int, worker: Staff) -> Vector2:
+	return unoccupied_point(station_cell(role,floor_level),floor_level,worker)
+
+func station_cell(role: String, floor_level: int) -> Vector2i:
+	if role == "Barista": return Vector2i(3,3) if floor_level == 1 else Vector2i(2,3)
+	if floor_level == 2: return Vector2i(4,3)
+	return STATIONS.get(role, Vector2i(5,3))
+
+func cashier_cell(floor_level: int) -> Vector2i:
+	return Vector2i(8,3) if floor_level == 1 else Vector2i(4,2)
+
+func table_point(index: int) -> Vector2:
+	var floor_level: int = table_floor(index)
+	return cell_to_screen(navigation.interaction(table_cell(index),floor_level),floor_level)
 
 func update_camera(delta: float) -> void:
 	if not world_camera: return
@@ -305,12 +358,18 @@ func focus_floor(floor_level: int) -> void:
 	camera_velocity = Vector2.ZERO
 	clamp_camera()
 
+func current_unix() -> int:
+	return replay_unix if replay_unix > 0 else int(Time.get_unix_time_from_system())
+
+func local_datetime() -> Dictionary:
+	return Time.get_datetime_dict_from_unix_time(current_unix() + int(Time.get_time_zone_from_system().bias) * 60)
+
 func update_world_clock() -> void:
-	var local_time: Dictionary = Time.get_datetime_dict_from_system()
-	world_minutes = float(int(local_time.get("hour", 0)) * 60 + int(local_time.get("minute", 0)))
+	var local_time: Dictionary = local_datetime()
+	world_minutes = float(int(local_time.hour) * 60 + int(local_time.minute))
 
 func calendar_date_key() -> String:
-	var local_time: Dictionary = Time.get_datetime_dict_from_system()
+	var local_time: Dictionary = local_datetime()
 	return "%04d-%02d-%02d" % [int(local_time.get("year", 0)), int(local_time.get("month", 0)), int(local_time.get("day", 0))]
 
 func finalize_calendar_rollover() -> void:
@@ -319,7 +378,7 @@ func finalize_calendar_rollover() -> void:
 		active_calendar_date = today
 		needs_new_calendar_day = true
 		return
-	if active_calendar_date == today: return
+	if active_calendar_date >= today: return
 	real_time_closing = true
 	close_day(false)
 	real_time_closing = false
@@ -331,10 +390,8 @@ func finalize_calendar_rollover() -> void:
 	prepare_daily_event()
 	event_resolved = true
 	event_result_text = "自动经营：今日事件采用默认方案"
-	if settlement_panel: settlement_panel.hide()
-	if prep_panel: prep_panel.hide()
 	begin_auto_business()
-
+	save_game()
 
 func cell_to_screen(cell: Vector2i, floor_level: int = 1) -> Vector2:
 	return world.floor_grid_to_screen(cell, floor_level)
@@ -399,7 +456,7 @@ func active_table_cells() -> Array[Vector2i]:
 		elif item_type == "DoubleTable":
 			var origin: Vector2i = Vector2i(int(item.get("x", 0)), int(item.get("y", 0)))
 			cells.append(origin)
-			cells.append(origin + Vector2i(1, 0))
+			cells.append(origin + (Vector2i(0, 1) if int(item.get("rotation", 0)) % 2 == 1 else Vector2i(1, 0)))
 	return cells
 
 func table_cell(index: int) -> Vector2i:
@@ -419,15 +476,39 @@ func table_floor(index: int) -> int:
 	return 1
 
 func sync_furniture_state() -> void:
+	var old_keys: Array[String] = table_keys.duplicate()
+	var old_states: Array[String] = world.table_states.duplicate()
+	var old_owners: Array = table_owner.duplicate()
 	world.set_second_floor(second_floor_unlocked, second_floor_level)
-	var slots: int = active_table_cells().size()
-	while table_owner.size() < slots:
-		table_owner.append(null)
-	while world.table_states.size() < slots:
-		world.table_states.append("Free")
+	table_keys.clear()
+	for i in world.all_table_cells().size():
+		table_keys.append("fixed:%d:%s" % [world.table_floor(i), str(world.all_table_cells()[i])])
+	for item in furniture_items:
+		var slots: int = 2 if item.type == "DoubleTable" else (1 if item.type == "SingleTable" else 0)
+		for slot in slots: table_keys.append("furniture:%d:%d" % [int(item.id), slot])
+	table_owner.clear()
+	world.table_states.clear()
+	for key in table_keys:
+		var old_index: int = old_keys.find(key)
+		table_owner.append(old_owners[old_index] if old_index >= 0 else null)
+		world.table_states.append(old_states[old_index] if old_index >= 0 else "Free")
+	for worker in staff:
+		if worker.task.get("kind", "") in ["clean", "take", "deliver"]: cancel_task(worker)
+	for guest in customers.duplicate():
+		if guest.table_index < 0: continue
+		var key: String = old_keys[guest.table_index] if guest.table_index < old_keys.size() else ""
+		guest.table_index = table_keys.find(key)
+		if guest.table_index < 0:
+			leave(guest, false, "座位已移除")
+		else:
+			guest.floor_level = table_floor(guest.table_index)
+			if guest.phase in ["walking", "seated", "ordered", "ready", "drinking"]:
+				guest.target_position = cell_to_screen(table_cell(guest.table_index), guest.floor_level)
+	navigation.rebuild(self, furniture_items)
+	for guest in customers:
+		if guest.table_index >= 0 and guest.phase in ["walking", "seated", "ordered", "ready", "drinking"]: guest.target_position = table_point(guest.table_index)
 	world.set_furniture(furniture_items, expansions, decor_pending_type, Vector2i.ZERO, false, decor_rotation, active_decor_floor)
-	if bool(expansions.get("LeftWindow", false)):
-		camera_bounds = Rect2(-560, 90, 1810, 850)
+	if bool(expansions.get("LeftWindow", false)): camera_bounds = Rect2(-560, 90, 1810, 850)
 	recalculate_environment()
 
 func placed_count(item_type: String) -> int:
@@ -441,28 +522,42 @@ func recalculate_environment() -> void:
 	environment_score = placed_count("Sofa") * 3 + placed_count("Plant") * 2
 
 func spawn_staff() -> void:
-	for old in staff: old.queue_free()
+	var previous_staff: Array[Staff] = staff.duplicate()
 	staff.clear()
 	sss_active = false
 	enforce_staff_capacity()
 	for i in employee_data.size():
 		if not bool(owned_staff.get(str(employee_data[i].get("name", "")), false)):
 			continue
-		var w: Staff = StaffScript.new(); w.setup(employee_data[i]); w.assigned = bool(staff_assignments.get(w.display_name, false))
-		if not w.assigned: continue
+		var name: String = str(employee_data[i].name)
+		if not bool(staff_assignments.get(name, false)): continue
+		var w: Staff = null
+		for existing in previous_staff:
+			if existing.display_name == name: w = existing; break
+		var is_new: bool = w == null
+		if is_new: w = StaffScript.new(); w.setup(employee_data[i])
+		w.assigned = true
+		w.make_skill = int(employee_data[i].make)
+		w.service_skill = int(employee_data[i].service)
+		w.clean_skill = int(employee_data[i].clean)
+		if not is_new and w.floor_level != int(staff_floors.get(name, 1)): cancel_task(w)
 		w.floor_level = int(staff_floors.get(w.display_name, 1))
-		w.position = cell_to_screen(Vector2i(1 + (i % 2), 4 + int(floor(float(i) / 2.0))), w.floor_level); w.target_position = w.position; w.z_index = int(w.position.y); shop_layer.add_child(w); staff.append(w)
+		if is_new: w.navigation_floor = w.floor_level; w.position = staff_station_point(w.role,w.floor_level,w); w.target_position = w.position; w.z_index = 1000 + int(w.position.y); shop_layer.add_child(w)
+		staff.append(w)
 		if w.quality == "SSS" and w.assigned: sss_active = true
+	for old in previous_staff:
+		if old not in staff: cancel_task(old); old.queue_free()
 	world.night_mode = sss_active
 	world.queue_redraw()
 
 func spawn_customer() -> void:
 	if phase != "Open": return
-	if day == 1 and spawned_today >= 3: return
+	for actor in staff + customers:
+		if actor.navigation_floor == 1 and actor.position.distance_to(cell_to_screen(Vector2i(10,10))) < 24.0: return
 	if randf() > float(event_modifiers.get("traffic", 1.0)): return
 	if free_table() < 0 and customers.filter(func(queued_guest): return queued_guest.phase == "queue").size() >= 1: return
 	var queue_count: int = customers.filter(func(queued_guest): return queued_guest.phase == "queue").size()
-	if queue_count >= queue_limit:
+	if queue_count >= mini(queue_limit,QUEUE.size()):
 		return
 	var new_customer: Customer = CustomerScript.new()
 	var customer_type: String = "普通顾客"
@@ -479,7 +574,7 @@ func spawn_customer() -> void:
 	if customer_type == "学生": new_customer.patience += 45.0
 	if customer_type == "白领": new_customer.patience -= 30.0
 	new_customer.patience += float(environment_score) * 2.0
-	new_customer.position = cell_to_screen(Vector2i(10,10)); new_customer.target_position = cell_to_screen(QUEUE[queue_count]); new_customer.z_index = int(new_customer.position.y); shop_layer.add_child(new_customer); customers.append(new_customer)
+	new_customer.position = cell_to_screen(Vector2i(10,10)); new_customer.target_position = cell_to_screen(QUEUE[queue_count]); new_customer.z_index = 1000 + int(new_customer.position.y); shop_layer.add_child(new_customer); customers.append(new_customer)
 	spawned_today += 1
 
 func advance_customer(c: Customer, dt: float) -> void:
@@ -490,15 +585,15 @@ func advance_customer(c: Customer, dt: float) -> void:
 	if c.phase == "queue" and actor_at_target(c): try_seat(c)
 	if c.phase == "stairs_up" and actor_at_target(c):
 		c.phase = "walking"
-		c.target_position = cell_to_screen(table_cell(c.table_index), 2)
+		c.target_position = table_point(c.table_index)
 	if c.phase == "drinking" and c.drink_timer <= 0:
-		c.phase="paying"; c.state_text="付款中"; c.target_position=cell_to_screen(Vector2i(8,2), c.floor_level)
+		c.phase="paying"; c.state_text="付款中"; c.target_position=unoccupied_point(cashier_cell(c.floor_level),c.floor_level,c)
 	if c.phase == "paying" and actor_at_target(c) and not c.payment_recorded:
 		record_payment(c)
 		c.payment_recorded = true
 		c.phase = "leaving"
 		c.state_text = "离店中"
-		c.target_position = cell_to_screen(Vector2i(9,7), 2) if c.floor_level == 2 else cell_to_screen(Vector2i(10,10))
+		c.target_position = cell_to_screen(navigation.stair(2), 2) if c.floor_level == 2 else cell_to_screen(Vector2i(10,10))
 		if c.floor_level == 2: c.phase = "stairs_down"
 	if c.phase == "stairs_down" and actor_at_target(c):
 		c.floor_level = 1
@@ -516,9 +611,9 @@ func try_seat(c: Customer) -> void:
 	c.table_index = available; table_owner[available] = c; world.table_states[available]="Seating"; world.queue_redraw()
 	var destination_floor: int = table_floor(available)
 	if destination_floor == 2:
-		c.phase="stairs_up"; c.state_text="上楼中"; c.target_position=cell_to_screen(Vector2i(9,7), 2)
+		c.phase="stairs_up"; c.state_text="上楼中"; c.target_position=cell_to_screen(navigation.stair(2), 2)
 	else:
-		c.phase="walking"; c.state_text="前往座位"; c.target_position=cell_to_screen(table_cell(available), 1)
+		c.phase="walking"; c.state_text="前往座位"; c.target_position=table_point(available)
 
 func free_table() -> int:
 	var usable: int = mini(active_table_cells().size(), 3 + int(upgrades.get("Tables", 1)) + placed_count("SingleTable") + placed_count("DoubleTable") * 2)
@@ -567,18 +662,21 @@ func apply_day_unlocks() -> void:
 
 func assign_tasks() -> void:
 	# Seat queued guests as soon as a cleaned table becomes available.
-	for c in customers:
-		if c.phase == "queue": try_seat(c)
+	for c in customers.duplicate():
+		if c.phase == "queue" and actor_at_target(c): try_seat(c)
 		if c.phase == "walking" and actor_at_target(c):
+			if available_drinks().is_empty():
+				leave(c, false, "暂无可售饮品")
+				return
 			c.phase="seated"; c.order=available_drinks().pick_random(); c.state_text="点单中"; world.table_states[c.table_index]="Order"; world.queue_redraw()
 	# Each order has one state and gets one worker task at a time.
 	for order_guest in customers:
 		if order_guest.phase == "seated" and not has_order(order_guest):
 			var waiter: Staff = idle_role("Waiter", order_guest.floor_level)
-			if waiter: give_task(waiter,{"kind":"take","guest":order_guest,"target":order_guest.position,"stage":"move","remaining":1.0})
-		if order_guest.phase == "ordered":
+			if waiter: give_task(waiter,{"kind":"take","guest":order_guest,"target":staff_contact_point(order_guest,waiter),"stage":"move","remaining":1.0})
+		if order_guest.phase == "ordered" and not guest_has_task(order_guest):
 			var barista: Staff = idle_role("Barista", order_guest.floor_level)
-			if barista and ingredients_for(order_guest.order): give_task(barista,{"kind":"make","guest":order_guest,"target":cell_to_screen(STATIONS.Barista, order_guest.floor_level),"stage":"move","remaining":make_time(barista,order_guest.order)})
+			if barista and ingredients_for(order_guest.order): give_task(barista,{"kind":"make","guest":order_guest,"target":staff_station_point("Barista",order_guest.floor_level,barista),"stage":"move","remaining":make_time(barista,order_guest.order)})
 			elif not ingredients_for(order_guest.order):
 				if order_guest.state_text == "缺货等待":
 					continue
@@ -591,19 +689,20 @@ func assign_tasks() -> void:
 				else:
 					order_guest.state_text = "缺货等待"
 				show_alert("缺货：%s" % order_guest.order)
-		if order_guest.phase == "ready":
+		if order_guest.phase == "ready" and not guest_has_task(order_guest):
 			var server: Staff = idle_role("Waiter", order_guest.floor_level)
-			if server: give_task(server,{"kind":"deliver","guest":order_guest,"target":cell_to_screen(STATIONS.Barista, order_guest.floor_level),"stage":"move_pickup","remaining":0.0})
+			if server: give_task(server,{"kind":"deliver","guest":order_guest,"target":staff_station_point("Barista",order_guest.floor_level,server),"stage":"move_pickup","remaining":0.0})
 	for i in world.table_states.size():
-		if world.table_states[i] == "Dirty":
+		if world.table_states[i] == "Dirty" and not table_has_task(i):
 			var cleaner: Staff = idle_role("Cleaner", table_floor(i))
 			if cleaner == null:
 				cleaner = idle_role("Waiter", table_floor(i))
-			if cleaner: give_task(cleaner,{"kind":"clean","table":i,"target":cell_to_screen(table_cell(i), table_floor(i)),"stage":"move","remaining":max(1.0,3.5-cleaner.clean_skill*.45)})
+			if cleaner: give_task(cleaner,{"kind":"clean","table":i,"target":table_point(i),"stage":"move","remaining":max(1.0,3.5-cleaner.clean_skill*.45)})
 
 func advance_staff(w: Staff, _dt: float) -> void:
 	if not w.assigned: return
 	if w.task.is_empty():
+		if w.yield_timer > 0.0: return
 		if w.stamina < 25.0 or w.resting:
 			w.resting = true
 			w.target_position = w.position
@@ -613,10 +712,14 @@ func advance_staff(w: Staff, _dt: float) -> void:
 			return
 		var standby_value: Variant = STATIONS.get(w.role, STATIONS.get("Manager", Vector2i.ZERO))
 		var standby_cell: Vector2i = standby_value if standby_value is Vector2i else Vector2i.ZERO
-		w.target_position = cell_to_screen(standby_cell, w.floor_level)
+		if not actor_at_target(w) and not w.route_failed: return
+		w.target_position = staff_station_point(w.role,w.floor_level,w)
 		w.state_text="待命"
 		return
 	var task: Dictionary = w.task
+	if task.has("guest") and (not is_instance_valid(task.guest) or task.guest not in customers):
+		cancel_task(w)
+		return
 	if task.get("kind", "") == "deliver":
 		advance_delivery_task(w, task)
 		return
@@ -632,9 +735,9 @@ func advance_delivery_task(w: Staff, task: Dictionary) -> void:
 	if task.get("stage", "") == "move_pickup" and actor_at_target(w):
 		# The drink is picked up at the machine, then carried visibly to its table.
 		task["stage"] = "move_table"
-		task["target"] = guest.position
+		task["target"] = staff_contact_point(guest,w)
 		w.task = task
-		w.target_position = guest.position
+		w.target_position = task.target
 		w.state_text = "端咖啡送餐"
 		return
 	if task.get("stage", "") == "move_table" and actor_at_target(w):
@@ -654,19 +757,23 @@ func complete_task(w: Staff) -> void:
 		task_guest.phase="ordered"
 		task_guest.state_text="订单已送出"
 		world.table_states[task_guest.table_index]="Making"
-		# Day-one handoff is immediate: taking an order directly reserves Lin's brew task.
+		# Release the taking task before reserving the next stage.
+		w.task = {}
 		var barista: Staff = idle_role("Barista", task_guest.floor_level)
-		if barista and ingredients_for(task_guest.order):
-			give_task(barista, {"kind":"make","guest":task_guest,"target":cell_to_screen(STATIONS.Barista, task_guest.floor_level),"stage":"move","remaining":make_time(barista,task_guest.order)})
+		if barista and not guest_has_task(task_guest, w) and ingredients_for(task_guest.order):
+			give_task(barista, {"kind":"make","guest":task_guest,"target":staff_station_point("Barista",task_guest.floor_level,barista),"stage":"move","remaining":make_time(barista,task_guest.order)})
 		else:
 			show_alert("咖啡师或食材暂不可用")
 	elif t.kind == "make" and is_instance_valid(task_guest) and task_guest.phase == "ordered":
-		consume(task_guest.order, task_guest.floor_level); task_guest.phase="ready"; task_guest.state_text="饮品完成"; world.table_states[task_guest.table_index]="Ready"
+		release_reservation(w); consume(str(t.drink), task_guest.floor_level); task_guest.phase="ready"; task_guest.state_text="饮品完成"; world.table_states[task_guest.table_index]="Ready"
 	elif t.kind == "deliver" and is_instance_valid(task_guest) and task_guest.phase == "ready":
 		task_guest.phase="drinking"; task_guest.drink_timer=7.0; task_guest.state_text="享用中"; world.table_states[task_guest.table_index]="Occupied"
 		drink_counts[task_guest.order] = int(drink_counts.get(task_guest.order, 0)) + 1
 	elif t.kind == "clean":
-		var table: int = int(t.get("table", -1)); world.table_states[table]="Free"; table_owner[table]=null; world.queue_redraw()
+		var table: int = table_keys.find(str(t.get("table_key", "")))
+		if table >= 0 and world.table_states[table] == "Dirty":
+			world.table_states[table]="Free"; table_owner[table]=null; world.queue_redraw()
+	release_reservation(w)
 	w.task={}
 
 func leave(c: Customer, paid: bool, reason: String) -> void:
@@ -685,6 +792,7 @@ func record_payment(c: Customer) -> void:
 	elif c.customer_type == "白领": price = int(round(float(price) * 1.1))
 	if c.high_spender: price=int(price*2.0)
 	if sss_active and c.order == "Sea Salt Latte": price = int(price * 1.5)
+	if replaying: offline_earnings += price
 	revenue += price; coins += price; satisfaction=clampf(satisfaction+1.0,0,100); daily_served += 1
 	if c.floor_level == 2:
 		second_floor_revenue += price
@@ -698,10 +806,15 @@ func record_payment(c: Customer) -> void:
 		show_alert("三位顾客均已完成服务，可以结算营业")
 
 func remove_customer(c: Customer) -> void:
-	if c.table_index >= 0:
+	navigation.release_stairs(c)
+	for worker in staff:
+		if worker.task.get("guest") == c: cancel_task(worker)
+	if c.table_index >= 0 and c.table_index < table_owner.size() and table_owner[c.table_index] == c:
 		world.table_states[c.table_index]="Dirty"
 		world.queue_redraw()
-	customers.erase(c); c.queue_free()
+	customers.erase(c)
+	if replaying: c.free()
+	else: c.queue_free()
 
 func has_order(c: Customer) -> bool:
 	for w in staff:
@@ -713,14 +826,47 @@ func idle_role(role: String, floor_level: int = 1) -> Staff:
 		if w.role == role and w.floor_level == floor_level and w.assigned and w.task.is_empty() and not w.resting: return w
 	return null
 
-func give_task(w: Staff, task: Dictionary) -> void: w.task=task; w.target_position=task.target; w.state_text="前往工作"
-func actor_at_target(actor: CafeActor) -> bool: return actor.position.distance_to(actor.target_position) <= 5.0
+func give_task(w: Staff, task: Dictionary) -> void:
+	if task.kind == "make":
+		var drink: String = task.guest.order
+		if guest_has_task(task.guest) or not ingredients_for(drink): return
+		task["drink"] = drink
+		task["reserved"] = menu_recipe(drink).ingredients.duplicate()
+		for ingredient in task.reserved:
+			reserved_ingredients[ingredient] = int(reserved_ingredients.get(ingredient, 0)) + int(task.reserved[ingredient])
+	elif task.kind == "clean":
+		if table_has_task(int(task.table)): return
+		task["table_key"] = table_keys[int(task.table)]
+	w.task = task
+	w.target_position = task.target
+	w.state_text = "前往工作"
+
+func guest_has_task(guest: Customer, except_worker: Staff = null) -> bool:
+	for worker in staff:
+		if worker != except_worker and worker.task.get("guest") == guest: return true
+	return false
+
+func table_has_task(index: int) -> bool:
+	for worker in staff:
+		if worker.task.get("kind", "") == "clean" and worker.task.get("table_key", "") == table_keys[index]: return true
+	return false
+
+func release_reservation(worker: Staff) -> void:
+	for ingredient in worker.task.get("reserved", {}):
+		reserved_ingredients[ingredient] = maxi(0, int(reserved_ingredients.get(ingredient, 0)) - int(worker.task.reserved[ingredient]))
+	worker.task.erase("reserved")
+
+func cancel_task(worker: Staff) -> void:
+	release_reservation(worker)
+	worker.task = {}
+
+func actor_at_target(actor: CafeActor) -> bool: return actor.stair_elapsed < 0.0 and not actor.route_failed and actor.position.distance_to(actor.target_position) <= 1.0
 func ingredients_for(drink: String) -> bool:
 	var recipe: Dictionary = menu_recipe(drink)
 	var needs_value: Variant = recipe.get("ingredients", {})
 	if not needs_value is Dictionary: return false
 	for item in needs_value:
-		if int(ingredients.get(str(item), 0)) < int(needs_value.get(item, 0)): return false
+		if int(ingredients.get(str(item), 0)) - int(reserved_ingredients.get(str(item), 0)) < int(needs_value.get(item, 0)): return false
 	return true
 func consume(drink: String, floor_level: int = 1) -> void:
 	var recipe: Dictionary = menu_recipe(drink)
@@ -1024,7 +1170,7 @@ func current_activity() -> String:
 		if not w.task.is_empty():
 			var labels: Dictionary = {"take":"正在接单","make":"正在制作咖啡","deliver":"正在送餐","clean":"正在清洁"}
 			return "%s %s" % [w.display_name, str(labels.get(str(w.task.get("kind", "")), "正在工作"))]
-	for c in customers:
+	for c in customers.duplicate():
 		if c.phase in ["queue", "walking"]: return "顾客正在进店入座"
 		if c.phase == "paying": return "顾客正在付款"
 	return "等待第一位顾客"
@@ -1112,8 +1258,8 @@ func furniture_size(item_type: String, rotation: int) -> Vector2i:
 
 func occupied_by_fixed_layout(cell: Vector2i) -> bool:
 	if active_decor_floor == 2:
-		return (cell.x >= 1 and cell.x <= 3 and cell.y >= 1 and cell.y <= 2) or cell == Vector2i(9,7)
-	if cell == Vector2i(10,10) or cell in TABLES or cell in QUEUE:
+		return (cell.x >= 1 and cell.x <= 3 and cell.y >= 1 and cell.y <= 2) or cell in world.second_floor_table_cells() or cell in [navigation.stair(2),station_cell("Barista",2),cashier_cell(2)]
+	if cell == Vector2i(10,10) or cell in TABLES or cell in QUEUE or cell in [navigation.stair(1),station_cell("Barista",1),cashier_cell(1)]:
 		return true
 	if cell.x >= 2 and cell.x <= 4 and cell.y >= 1 and cell.y <= 2:
 		return true
@@ -1135,6 +1281,26 @@ func is_valid_furniture_placement(item_type: String, cell: Vector2i, rotation: i
 				var other_size: Vector2i = furniture_size(other_type, int(item.get("rotation", 0)))
 				if test_cell.x >= other_origin.x and test_cell.x < other_origin.x + other_size.x and test_cell.y >= other_origin.y and test_cell.y < other_origin.y + other_size.y:
 					return false
+	for actor in staff + customers:
+		if actor.navigation_floor != active_decor_floor: continue
+		var occupied: Vector2i = world.screen_to_floor_grid(actor.position, active_decor_floor)
+		if Rect2i(cell,size).has_point(occupied): return false
+	var proposed: Array = []
+	for item in furniture_items:
+		if int(item.get("id", -1)) != ignore_id: proposed.append(item)
+	proposed.append({"id":ignore_id,"type":item_type,"x":cell.x,"y":cell.y,"rotation":rotation,"floor":active_decor_floor})
+	var candidate := CafeNavigation.new()
+	candidate.rebuild(self,proposed)
+	if not candidate.layout_accessible(): return false
+	var entrance: Vector2i = Vector2i(10,10) if active_decor_floor == 1 else candidate.stair(2)
+	for item in proposed:
+		if int(item.get("floor",1)) != active_decor_floor: continue
+		if str(item.type) not in ["SingleTable","DoubleTable","CoffeeMachine","Register"]: continue
+		var origin := Vector2i(int(item.x),int(item.y))
+		var slots: Array[Vector2i] = [origin]
+		if item.type == "DoubleTable": slots.append(origin + (Vector2i(1,0) if int(item.rotation) % 2 == 0 else Vector2i(0,1)))
+		for slot in slots:
+			if candidate.cell_path(entrance,candidate.interaction(slot,active_decor_floor),active_decor_floor).is_empty(): return false
 	return true
 
 func begin_furniture_placement(item_type: String) -> void:
@@ -1159,7 +1325,7 @@ func cancel_furniture_placement() -> void:
 	world.set_furniture(furniture_items, expansions, "", Vector2i.ZERO, false, 0, active_decor_floor)
 
 func place_or_select_furniture(screen_position: Vector2) -> void:
-	var cell: Vector2i = world.screen_to_floor_grid(shop_layer.to_local(screen_position), active_decor_floor)
+	var cell: Vector2i = world.screen_to_floor_grid(shop_layer.get_global_transform_with_canvas().affine_inverse() * screen_position, active_decor_floor)
 	if decor_pending_type != "":
 		if is_valid_furniture_placement(decor_pending_type, cell, decor_rotation):
 			furniture_items.append({"id":next_furniture_id, "type":decor_pending_type, "x":cell.x, "y":cell.y, "rotation":decor_rotation, "floor":active_decor_floor})
@@ -1198,7 +1364,7 @@ func place_or_select_furniture(screen_position: Vector2) -> void:
 
 func update_furniture_preview(screen_position: Vector2) -> void:
 	if not world.decoration_mode or decor_pending_type == "": return
-	var cell: Vector2i = world.screen_to_floor_grid(shop_layer.to_local(screen_position), active_decor_floor)
+	var cell: Vector2i = world.screen_to_floor_grid(shop_layer.get_global_transform_with_canvas().affine_inverse() * screen_position, active_decor_floor)
 	world.set_furniture(furniture_items, expansions, decor_pending_type, cell, is_valid_furniture_placement(decor_pending_type, cell, decor_rotation), decor_rotation, active_decor_floor)
 
 func rotate_selected_or_pending() -> void:
@@ -1480,7 +1646,7 @@ func touch_midpoint() -> Vector2:
 	return (first + second) * 0.5
 
 func select_actor_at(screen_position: Vector2) -> void:
-	var shop_pointer: Vector2 = shop_layer.to_local(screen_position)
+	var shop_pointer: Vector2 = shop_layer.get_global_transform_with_canvas().affine_inverse() * screen_position
 	var closest: CafeActor = null
 	var best_distance: float = 48.0
 	var actors: Array = []
@@ -1528,7 +1694,7 @@ func start_day() -> void:
 	if day == 1:
 		for item in ["Beans", "Milk", "Syrup", "Flour", "Cream"]:
 			ingredients[item] = maxi(int(ingredients.get(item, 0)), 20)
-	prep_panel.hide()
+	if prep_panel: prep_panel.hide()
 	phase="Open"; elapsed=0; revenue=0; second_floor_revenue=0; second_floor_served=0; second_floor_satisfaction_total=0.0; second_floor_ingredient_cost=0; spawn_timer=.1; daily_ingredient_cost=0; daily_spoilage_cost=0; daily_stockout_losses=0; daily_angry_leaves=0; daily_served=0; drink_counts={}; spawned_today=0; day_one_ready_to_close=false
 
 func begin_next_day_auto() -> void:
@@ -1680,6 +1846,9 @@ func refresh_menu_panel() -> void:
 	apply_ui_readability(menu_list)
 
 func toggle_menu_item(drink: String) -> void:
+	if bool(active_menu.get(drink, false)) and available_drinks().size() <= 1:
+		show_alert("请至少保留一种在售饮品")
+		return
 	active_menu[drink] = not bool(active_menu.get(drink, false))
 	refresh_menu_panel(); save_game()
 
@@ -1780,19 +1949,32 @@ func settle_wages(wages: int) -> void:
 
 func apply_daily_spoilage() -> void:
 	for item in ["Milk", "Cream"]:
-		var stock: int = int(ingredients.get(item, 0))
+		var stock: int = maxi(0, int(ingredients.get(item, 0)) - int(reserved_ingredients.get(item, 0)))
 		if stock <= 0: continue
 		var loss_rate: float = maxf(0.02, 0.10 - float(fridge_level) * 0.03)
 		var lost: int = mini(stock, maxi(1, floori(float(stock) * loss_rate)))
-		ingredients[item] = stock - lost
+		ingredients[item] = int(ingredients.get(item, 0)) - lost
 		daily_spoilage_cost += lost * int(market_prices.get(item, 0))
 func close_day(show_settlement: bool = true) -> void:
+	if active_calendar_date == last_settled_date or phase != "Open": return
 	if day == 1 and not day_one_ready_to_close and not real_time_closing:
 		show_alert("请先完成三位顾客的服务")
 		return
 	if daily_served <= 0 and not real_time_closing:
 		show_alert("至少完成一位顾客的服务后才能结算")
 		return
+	# At closing, bill only drinks already delivered; retire unfinished orders.
+	for guest in customers.duplicate():
+		if guest.phase in ["drinking", "paying"] and not guest.payment_recorded:
+			record_payment(guest)
+			guest.payment_recorded = true
+		remove_customer(guest)
+	for worker in staff: cancel_task(worker)
+	for index in table_owner.size():
+		table_owner[index] = null
+		world.table_states[index] = "Free"
+	last_settled_date = active_calendar_date
+	needs_new_calendar_day = true
 	phase="Closed"
 	apply_daily_spoilage()
 	var wages: int = daily_wages()
@@ -1823,7 +2005,7 @@ func close_day(show_settlement: bool = true) -> void:
 			competition_text = "\n咖啡比赛成绩 %d/70：继续提升菜单、咖啡师与环境。" % competition_score
 	add_reputation(reputation_gain)
 	var second_floor_satisfaction: int = roundi(second_floor_satisfaction_total / float(second_floor_served)) if second_floor_served > 0 else 0
-	settlement_label.text = "第 %d 天 · 营业结算\n%s\n\n营业额：%d（一楼 %d · 二楼 %d）\n二楼：满意度 %s · 食材消耗 %d\n食材成本：-%d · 损耗：-%d · 工资：-%d\n缺货损失：%d 次\n利润：%d\n声望：+%d · 当前 Lv.%d\n今日事件：%s\n应对：%s%s" % [day,"★".repeat(stars)+"☆".repeat(3-stars),revenue,revenue-second_floor_revenue,second_floor_revenue,"%d%%" % second_floor_satisfaction if second_floor_served > 0 else "暂无二楼顾客",second_floor_ingredient_cost,daily_ingredient_cost,daily_spoilage_cost,wages,daily_stockout_losses,profit,reputation_gain,reputation,str(current_event.get("title", "无")),event_result_text,competition_text]
+	if settlement_label: settlement_label.text = "第 %d 天 · 营业结算\n%s\n\n营业额：%d（一楼 %d · 二楼 %d）\n二楼：满意度 %s · 食材消耗 %d\n食材成本：-%d · 损耗：-%d · 工资：-%d\n缺货损失：%d 次\n利润：%d\n声望：+%d · 当前 Lv.%d\n今日事件：%s\n应对：%s%s" % [day,"★".repeat(stars)+"☆".repeat(3-stars),revenue,revenue-second_floor_revenue,second_floor_revenue,"%d%%" % second_floor_satisfaction if second_floor_served > 0 else "暂无二楼顾客",second_floor_ingredient_cost,daily_ingredient_cost,daily_spoilage_cost,wages,daily_stockout_losses,profit,reputation_gain,reputation,str(current_event.get("title", "无")),event_result_text,competition_text]
 	if show_settlement and settlement_panel:
 		settlement_panel.show()
 	day += 1
@@ -1832,6 +2014,7 @@ func close_day(show_settlement: bool = true) -> void:
 
 func record_financial_day(profit: int, wages: int) -> void:
 	var date_key: String = active_calendar_date if active_calendar_date != "" else calendar_date_key()
+	if financial_days.any(func(entry): return str(entry.get("date", "")) == date_key): return
 	financial_days.append({"date":date_key,"revenue":revenue,"ingredients":daily_ingredient_cost,"spoilage":daily_spoilage_cost,"wages":wages,"profit":profit})
 	if financial_days.size() > 370: financial_days.pop_front()
 func set_speed(value: float) -> void: speed_multiplier=value
@@ -1983,8 +2166,9 @@ func toggle_employee_floor(employee_name: String) -> void:
 			break
 	if moved_worker:
 		moved_worker.floor_level = next_floor
-		moved_worker.task = {"kind":"transfer","target":cell_to_screen(Vector2i(9,7), next_floor),"stage":"move","remaining":0.0}
-		moved_worker.target_position = cell_to_screen(Vector2i(9,7), next_floor)
+		cancel_task(moved_worker)
+		moved_worker.task = {"kind":"transfer","target":cell_to_screen(navigation.stair(next_floor), next_floor),"stage":"move","remaining":0.0}
+		moved_worker.target_position = cell_to_screen(navigation.stair(next_floor), next_floor)
 		moved_worker.state_text = "上下楼中"
 	else:
 		spawn_staff()
@@ -2002,6 +2186,7 @@ func dismiss_employee(employee_name: String) -> void:
 	save_game()
 	show_alert("%s 已解雇" % employee_name)
 func show_alert(text: String) -> void:
+	if replaying: return
 	if text.begins_with("缺货") or text == "咖啡师或食材暂不可用": return
 	alert_generation += 1
 	var generation: int = alert_generation
@@ -2011,9 +2196,17 @@ func show_alert(text: String) -> void:
 		if is_instance_valid(alert_label) and generation == alert_generation:
 			alert_label.hide()
 	)
-func save_game() -> void: SaveSystem.save_game({"day":day,"coins":coins,"revenue":revenue,"daily_ingredient_cost":daily_ingredient_cost,"daily_spoilage_cost":daily_spoilage_cost,"daily_served":daily_served,"active_calendar_date":active_calendar_date,"financial_days":financial_days,"ingredients":ingredients,"market_prices":market_prices,"market_trends":market_trends,"market_price_day":market_price_day,"fridge_level":fridge_level,"researched_menu":researched_menu,"active_menu":active_menu,"upgrades":upgrades,"unlocks":unlocks,"employee_levels":employee_levels,"owned_staff":owned_staff,"staff_assignments":staff_assignments,"staff_floors":staff_floors,"staff_loyalty":staff_loyalty,"staff_stars":staff_stars,"furniture_items":furniture_items,"expansions":expansions,"next_furniture_id":next_furniture_id,"ui_size_mode":ui_size_mode,"game_orientation":game_orientation,"reputation":reputation,"reputation_points":reputation_points,"coffee_competition_complete":coffee_competition_complete,"current_event":current_event,"event_day":event_day,"event_resolved":event_resolved,"event_result_text":event_result_text,"event_modifiers":event_modifiers,"market_candidates":market_candidates,"market_day":market_day,"market_refreshes_today":market_refreshes_today,"cleaning_room_level":cleaning_room_level,"second_floor_unlocked":second_floor_unlocked,"second_floor_level":second_floor_level,"settled_real_date":settled_real_date,"last_online_unix":int(Time.get_unix_time_from_system())})
+func save_game() -> void:
+	if replaying: return
+	if not SaveSystem.save_game(build_save_data()): show_alert("存档写入失败，请检查剩余空间后重试")
+
+func build_save_data() -> Dictionary:
+	return {"save_version":3,"runtime":snapshot_runtime(),"last_settled_date":last_settled_date,"paused":paused,"speed_multiplier":speed_multiplier,"needs_new_calendar_day":needs_new_calendar_day,"daily_stockout_losses":daily_stockout_losses,"daily_angry_leaves":daily_angry_leaves,"drink_counts":drink_counts,"spawned_today":spawned_today,"day_one_ready_to_close":day_one_ready_to_close,"second_floor_revenue":second_floor_revenue,"second_floor_served":second_floor_served,"second_floor_ingredient_cost":second_floor_ingredient_cost,"second_floor_satisfaction_total":second_floor_satisfaction_total,"satisfaction":satisfaction,"day":day,"coins":coins,"revenue":revenue,"daily_ingredient_cost":daily_ingredient_cost,"daily_spoilage_cost":daily_spoilage_cost,"daily_served":daily_served,"active_calendar_date":active_calendar_date,"financial_days":financial_days,"ingredients":ingredients,"market_prices":market_prices,"market_trends":market_trends,"market_price_day":market_price_day,"fridge_level":fridge_level,"researched_menu":researched_menu,"active_menu":active_menu,"upgrades":upgrades,"unlocks":unlocks,"employee_levels":employee_levels,"owned_staff":owned_staff,"staff_assignments":staff_assignments,"staff_floors":staff_floors,"staff_loyalty":staff_loyalty,"staff_stars":staff_stars,"furniture_items":furniture_items,"expansions":expansions,"next_furniture_id":next_furniture_id,"ui_size_mode":ui_size_mode,"game_orientation":game_orientation,"reputation":reputation,"reputation_points":reputation_points,"coffee_competition_complete":coffee_competition_complete,"current_event":current_event,"event_day":event_day,"event_resolved":event_resolved,"event_result_text":event_result_text,"event_modifiers":event_modifiers,"market_candidates":market_candidates,"market_day":market_day,"market_refreshes_today":market_refreshes_today,"cleaning_room_level":cleaning_room_level,"second_floor_unlocked":second_floor_unlocked,"second_floor_level":second_floor_level,"settled_real_date":settled_real_date,"last_online_unix":current_unix()}
+
 func load_save() -> void:
-	var data: Dictionary = SaveSystem.load_game()
+	apply_save_data(SaveSystem.load_game())
+
+func apply_save_data(data: Dictionary) -> void:
 	if data.is_empty(): return
 	day = int(data.get("day", day))
 	coins = int(data.get("coins", coins))
@@ -2092,9 +2285,154 @@ func load_save() -> void:
 	second_floor_unlocked = bool(data.get("second_floor_unlocked", second_floor_unlocked))
 	second_floor_level = int(data.get("second_floor_level", 1 if second_floor_unlocked else 0))
 	settled_real_date = str(data.get("settled_real_date", settled_real_date))
-	apply_offline_earnings(int(data.get("last_online_unix", 0)))
+	if not default_employee_data.is_empty(): employee_data.assign(default_employee_data.duplicate(true))
+	for employee in employee_data:
+		var stars: int = int(staff_stars.get(employee.name,0))
+		for skill in ["make","service","clean"]: employee[skill] = int(employee[skill]) + stars
+		if int(employee_levels.get(employee.name,0)) > 0:
+			var skill: String = {"Barista":"make","Waiter":"service","Cleaner":"clean"}.get(employee.role,"service")
+			employee[skill] = int(employee[skill]) + 1
+	saved_last_online = int(data.get("last_online_unix", 0))
+	saved_runtime = data.get("runtime", {}) if data.get("runtime", {}) is Dictionary else {}
+	last_settled_date = str(data.get("last_settled_date", ""))
+	if last_settled_date == "" and not financial_days.is_empty(): last_settled_date = str(financial_days[-1].get("date", ""))
+	needs_new_calendar_day = bool(data.get("needs_new_calendar_day", active_calendar_date == last_settled_date))
+	paused = bool(data.get("paused", false))
+	speed_multiplier = clampf(float(data.get("speed_multiplier", 1.0)),1.0,4.0)
+	satisfaction = clampf(float(data.get("satisfaction", 100.0)),0.0,100.0)
+	daily_stockout_losses = int(data.get("daily_stockout_losses", 0))
+	daily_angry_leaves = int(data.get("daily_angry_leaves", 0))
+	drink_counts = data.get("drink_counts", {})
+	spawned_today = int(data.get("spawned_today", 0))
+	day_one_ready_to_close = bool(data.get("day_one_ready_to_close", false))
+	second_floor_revenue = int(data.get("second_floor_revenue", 0))
+	second_floor_served = int(data.get("second_floor_served", 0))
+	second_floor_ingredient_cost = int(data.get("second_floor_ingredient_cost", 0))
+	second_floor_satisfaction_total = float(data.get("second_floor_satisfaction_total", 0.0))
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST or what == NOTIFICATION_APPLICATION_PAUSED: save_game()
 
 func _exit_tree() -> void:
-	if is_inside_tree(): save_game()
+	if world and is_instance_valid(world): save_game()
 func reset_save() -> void:
+	for guest in customers.duplicate(): remove_customer(guest)
+	for worker in staff: cancel_task(worker); worker.queue_free()
+	staff.clear()
+	reserved_ingredients.clear()
+	table_keys.clear()
+	table_owner.clear()
+	world.table_states.clear()
+	financial_days.clear()
+	if not default_employee_data.is_empty(): employee_data.assign(default_employee_data.duplicate(true))
+	saved_runtime.clear()
+	saved_last_online = 0
+	last_settled_date = ""
+	paused = false
+	speed_multiplier = 1.0
+	offline_earnings = 0
+	offline_minutes = 0
+	satisfaction = 100.0
 	SaveSystem.reset_game(); day=1; coins=800; ingredients={"Beans":30,"Milk":25,"Syrup":18,"Flour":12,"Cream":12}; market_prices={"Beans":2,"Milk":3,"Syrup":3,"Flour":2,"Cream":4}; market_trends={}; market_price_day=0; fridge_level=0; researched_menu={"Americano":true,"Latte":true,"Mocha":false,"Sea Salt Latte":false}; active_menu={"Americano":true,"Latte":true,"Mocha":false,"Sea Salt Latte":false}; upgrades={"Machine":1,"Register":1,"Tables":1}; unlocks={"Mocha":false,"SecondBarista":false,"PastryCase":false,"TalentMarket":false,"SeaSaltLatte":false}; employee_levels={}; owned_staff={"Lin":true,"June":true,"Bo":true,"Ari":true}; staff_assignments={"Lin":true,"June":true,"Bo":false,"Ari":false}; staff_floors={"Lin":1,"June":1,"Bo":1,"Ari":1}; staff_loyalty={}; staff_stars={}; reputation=1; reputation_points=0; coffee_competition_complete=false; current_event={}; event_day=0; event_resolved=true; event_result_text="自动经营：今日事件采用默认方案"; event_modifiers={"traffic":1.0,"student":false,"blogger":false,"vip":false,"sick":false,"competition":false}; market_candidates=[]; market_day=0; market_refreshes_today=0; cleaning_room_level=0; second_floor_unlocked=false; second_floor_level=0; furniture_items=[]; expansions={"LeftWindow":false}; next_furniture_id=1; active_calendar_date=calendar_date_key(); needs_new_calendar_day=true; sync_furniture_state(); refresh_market_for_day(); refresh_market_prices(); spawn_staff(); populate_staff_list(); if prep_panel: prep_panel.hide(); if settlement_panel: settlement_panel.hide(); begin_auto_business(); show_alert("存档已重置，咖啡店已自动营业")
+
+func snapshot_runtime() -> Dictionary:
+	var guests: Array = []
+	for guest in customers:
+		var entry: Dictionary = {}
+		for field in ["display_name","phase","order","high_spender","customer_type","floor_level","navigation_floor","patience","drink_timer","warning","payment_recorded","state_text","stair_elapsed","stair_floor","parked_for_stairs"]: entry[field] = guest.get(field)
+		entry["traffic_detour"] = serialize_detour(guest)
+		entry["stair_start"] = [guest.stair_start.x,guest.stair_start.y]
+		entry["stair_end"] = [guest.stair_end.x,guest.stair_end.y]
+		entry["position"] = [guest.position.x,guest.position.y]
+		entry["target"] = [guest.target_position.x,guest.target_position.y]
+		entry["table_key"] = table_keys[guest.table_index] if guest.table_index >= 0 else ""
+		guests.append(entry)
+	var workers: Array = []
+	for worker in staff:
+		var task: Dictionary = worker.task.duplicate(true)
+		if task.has("guest"):
+			task["guest_index"] = customers.find(task.guest)
+			task.erase("guest")
+		if task.has("target"): task.target = [task.target.x,task.target.y]
+		workers.append({"name":worker.display_name,"stamina":worker.stamina,"make_skill":worker.make_skill,"service_skill":worker.service_skill,"clean_skill":worker.clean_skill,"resting":worker.resting,"navigation_floor":worker.navigation_floor,"traffic_detour":serialize_detour(worker),"parked_for_stairs":worker.parked_for_stairs,"stair_elapsed":worker.stair_elapsed,"stair_floor":worker.stair_floor,"stair_start":[worker.stair_start.x,worker.stair_start.y],"stair_end":[worker.stair_end.x,worker.stair_end.y],"position":[worker.position.x,worker.position.y],"target":[worker.target_position.x,worker.target_position.y],"task":task})
+	var waiting: Array = []
+	for actor in navigation.stair_queue:
+		if not is_instance_valid(actor): continue
+		if actor is Customer and actor in customers: waiting.append({"guest_index":customers.find(actor)})
+		elif actor is Staff and actor in staff: waiting.append({"worker_name":actor.display_name})
+	return {"stair_queue":waiting,"guests":guests,"workers":workers,"table_keys":table_keys,"table_states":world.table_states,"spawn_timer":spawn_timer,"elapsed":elapsed,"pending_furniture_price":decor_pending_price}
+
+func restored_vector(value: Variant) -> Vector2:
+	return Vector2(float(value[0]),float(value[1])) if value is Array and value.size() == 2 else Vector2.ZERO
+
+func restore_runtime(data: Dictionary) -> void:
+	if data.is_empty(): return
+	navigation.stair_queue.clear()
+	navigation.stair_owner = null
+	# A placement preview is not a committed purchase; refund it on reopen.
+	coins += maxi(0,int(data.get("pending_furniture_price",0)))
+	for guest in customers: guest.queue_free()
+	customers.clear()
+	for worker in staff: cancel_task(worker)
+	for i in table_keys.size():
+		table_owner[i] = null
+		var old_index: int = data.get("table_keys", []).find(table_keys[i])
+		world.table_states[i] = str(data.table_states[old_index]) if old_index >= 0 and old_index < data.get("table_states", []).size() else "Free"
+	for entry in data.get("guests", []):
+		var guest := Customer.new()
+		guest.setup(str(entry.get("display_name","顾客")),bool(entry.get("high_spender",false)),str(entry.get("customer_type","普通顾客")))
+		for field in ["phase","order","floor_level","navigation_floor","patience","drink_timer","warning","payment_recorded","state_text","stair_elapsed","stair_floor","parked_for_stairs"]:
+			if entry.has(field): guest.set(field,entry[field])
+		restore_detour(guest,entry.get("traffic_detour",[]))
+		guest.stair_start = restored_vector(entry.get("stair_start",[]))
+		guest.stair_end = restored_vector(entry.get("stair_end",[]))
+		guest.position = restored_vector(entry.get("position",[]))
+		guest.target_position = restored_vector(entry.get("target",[]))
+		guest.table_index = table_keys.find(str(entry.get("table_key","")))
+		shop_layer.add_child(guest)
+		customers.append(guest)
+		if guest.table_index >= 0: table_owner[guest.table_index] = guest
+	spawn_timer = float(data.get("spawn_timer",0.1))
+	elapsed = float(data.get("elapsed",0.0))
+	for entry in data.get("workers", []):
+		for worker in staff:
+			if worker.display_name != str(entry.name): continue
+			worker.stamina = clampf(float(entry.get("stamina",100.0)),0.0,100.0)
+			for skill in ["make_skill","service_skill","clean_skill"]:
+				if entry.has(skill): worker.set(skill,int(entry[skill]))
+			worker.resting = bool(entry.get("resting",false))
+			worker.navigation_floor = int(entry.get("navigation_floor",worker.floor_level))
+			restore_detour(worker,entry.get("traffic_detour",[]))
+			worker.parked_for_stairs = bool(entry.get("parked_for_stairs",false))
+			worker.stair_elapsed = float(entry.get("stair_elapsed",-1.0))
+			worker.stair_floor = int(entry.get("stair_floor",worker.floor_level))
+			worker.stair_start = restored_vector(entry.get("stair_start",[]))
+			worker.stair_end = restored_vector(entry.get("stair_end",[]))
+			worker.position = restored_vector(entry.get("position",[]))
+			worker.target_position = restored_vector(entry.get("target",[]))
+			var task: Dictionary = entry.get("task", {}).duplicate(true)
+			if task.has("guest_index"):
+				var index: int = int(task.guest_index)
+				if index < 0 or index >= customers.size(): continue
+				task["guest"] = customers[index]
+				task.erase("guest_index")
+			if task.has("target"): task.target = restored_vector(task.target)
+			worker.task = task
+			for ingredient in task.get("reserved", {}): reserved_ingredients[ingredient] = int(reserved_ingredients.get(ingredient,0)) + int(task.reserved[ingredient])
+
+	for waiting in data.get("stair_queue", []):
+		if waiting.has("guest_index"):
+			var index: int = int(waiting.guest_index)
+			if index >= 0 and index < customers.size(): navigation.stair_queue.append(customers[index])
+		elif waiting.has("worker_name"):
+			for worker in staff:
+				if worker.display_name == str(waiting.worker_name): navigation.stair_queue.append(worker)
+
+func serialize_detour(actor: CafeActor) -> Array:
+	var result: Array = []
+	for waypoint in actor.traffic_detour: result.append({"point":[waypoint.point.x,waypoint.point.y],"floor":waypoint.floor})
+	return result
+
+func restore_detour(actor: CafeActor, data: Array) -> void:
+	actor.traffic_detour.clear()
+	for waypoint in data: actor.traffic_detour.append({"point":restored_vector(waypoint.get("point",[])),"floor":int(waypoint.get("floor",actor.navigation_floor))})

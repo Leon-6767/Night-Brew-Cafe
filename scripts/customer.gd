@@ -21,7 +21,7 @@ func setup(customer_name: String, high: bool, type_name: String = "普通顾客"
 
 func tick_customer(delta: float, running: bool) -> void:
 	if not running: return
-	if phase != "drinking": patience -= delta
+	if phase in ["queue", "stairs_up", "walking", "seated", "ordered", "ready"]: patience -= delta
 	if patience <= 18.0 and not warning:
 		warning = true
 		state_text = "等待不满"
